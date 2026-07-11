@@ -1,0 +1,1012 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <base target="_self">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sistema de Controle de Horários</title>
+    <meta name="description" content="Sistema de controle de horários com disponibilidade de membros, horário de sede, lembretes e justificativas.">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <style>
+        :root {
+            --primary: #4f46e5;
+            --primary-light: #818cf8;
+            --primary-dark: #3730a3;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --bg: #f8fafc;
+            --card: #ffffff;
+            --text: #1e293b;
+            --text-muted: #64748b;
+        }
+        * { font-family: 'Inter', sans-serif; }
+        body { background: var(--bg); color: var(--text); }
+        .fade-in { animation: fadeIn 0.3s ease; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        .slide-in { animation: slideIn 0.3s ease; }
+        @keyframes slideIn { from { opacity: 0; transform: translateX(-20px); } to { opacity: 1; transform: translateX(0); } }
+        .toast { position: fixed; bottom: 24px; right: 24px; z-index: 9999; }
+        .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center; }
+        .calendar-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(60px, 1fr)); gap: 4px; }
+        .time-slot { cursor: pointer; transition: all 0.2s; border-radius: 6px; padding: 6px 10px; text-align: center; font-size: 0.8rem; }
+        .time-slot:hover { transform: scale(1.05); }
+        .time-slot.selected { background: var(--primary) !important; color: white !important; }
+        .badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 500; }
+        .scrollbar-hide::-webkit-scrollbar { display: none; }
+        .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
+        .tab-active { border-bottom: 2px solid var(--primary); color: var(--primary); font-weight: 600; }
+        .member-tag { cursor: pointer; transition: all 0.2s; }
+        .member-tag.selected { background: var(--primary) !important; color: white !important; border-color: var(--primary) !important; }
+        .empty-state { padding: 40px 20px; text-align: center; color: var(--text-muted); }
+        @media (max-width: 640px) {
+            .calendar-grid { grid-template-columns: repeat(4, 1fr); }
+        }
+    </style>
+</head>
+<body>
+    <div id="app"></div>
+
+    <script>
+        // ============================================================
+        // DATA LAYER
+        // ============================================================
+
+        const DIAS = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"];
+        const HORARIOS = [
+            "07:00","08:00","09:00","10:00","11:00","12:00",
+            "13:00","14:00","15:00","16:00","17:00","18:00","19:00",
+            "20:00","21:00","22:00"
+        ];
+
+        // Estado global
+        let state = {
+            users: [],
+            currentUser: null,
+            justifications: [],
+            headquarterSchedule: { dias: {} },
+            reminders: [],
+            emailConfig: { enabled: false, smtp: "" },
+            selectedMembers: [],
+            statusMessage: null
+        };
+
+        // ============================================================
+        // PERSISTÊNCIA
+        // ============================================================
+
+        function loadState() {
+            try {
+                const saved = localStorage.getItem("scheduleControlState");
+                if (saved) {
+                    const parsed = JSON.parse(saved);
+                    state.users = parsed.users || [];
+                    state.currentUser = parsed.currentUser || null;
+                    state.justifications = parsed.justifications || [];
+                    state.headquarterSchedule = parsed.headquarterSchedule || { dias: {} };
+                    state.reminders = parsed.reminders || [];
+                    state.emailConfig = parsed.emailConfig || { enabled: false, smtp: "" };
+                }
+            } catch (e) { console.warn("Erro ao carregar estado:", e); }
+        }
+
+        function saveState() {
+            try {
+                localStorage.setItem("scheduleControlState", JSON.stringify({
+                    users: state.users,
+                    currentUser: state.currentUser,
+                    justifications: state.justifications,
+                    headquarterSchedule: state.headquarterSchedule,
+                    reminders: state.reminders,
+                    emailConfig: state.emailConfig
+                }));
+            } catch (e) { console.warn("Erro ao salvar estado:", e); }
+        }
+
+        // ============================================================
+        // UTILITÁRIOS
+        // ============================================================
+
+        function generateId() { return Date.now().toString(36) + Math.random().toString(36).substr(2, 5); }
+
+        function getDayName(dateStr) {
+            const diasSemana = ["Domingo","Segunda","Terça","Quarta","Quinta","Sexta","Sábado"];
+            return diasSemana[new Date(dateStr + "T12:00:00").getDay()];
+        }
+
+        function formatDate(dateStr) {
+            return new Date(dateStr + "T12:00:00").toLocaleDateString("pt-BR");
+        }
+
+        function showToast(message, type = "success") {
+            state.statusMessage = { message, type };
+            renderApp();
+            setTimeout(() => {
+                state.statusMessage = null;
+                renderApp();
+            }, 3000);
+        }
+
+        // ============================================================
+        // RENDER FUNCTIONS
+        // ============================================================
+
+        function renderHeader() {
+            if (!state.currentUser) return "";
+            const isAdmin = state.currentUser.isAdmin;
+            return `
+            <header class="bg-white shadow-sm border-b border-gray-200 sticky top-0 z-50">
+                <div class="max-w-6xl mx-auto px-4 sm:px-6">
+                    <div class="flex items-center justify-between h-16">
+                        <div class="flex items-center gap-3">
+                            <i class="fas fa-calendar-alt text-indigo-600 text-xl"></i>
+                            <span class="font-bold text-lg text-gray-800 hidden sm:block">Controle de Horários</span>
+                        </div>
+                        <div class="flex items-center gap-2 sm:gap-4">
+                            <button class="tab-btn px-2 sm:px-3 py-2 text-sm rounded-lg transition-colors ${state.currentView === 'dashboard' ? 'tab-active bg-indigo-50' : 'text-gray-600 hover:bg-gray-100'}" data-view="dashboard">
+                                <i class="fas fa-home"></i> <span class="hidden sm:inline">Dashboard</span>
+                            </button>
+                            <button class="tab-btn px-2 sm:px-3 py-2 text-sm rounded-lg transition-colors ${state.currentView === 'availability' ? 'tab-active bg-indigo-50' : 'text-gray-600 hover:bg-gray-100'}" data-view="availability">
+                                <i class="fas fa-clock"></i> <span class="hidden sm:inline">Disponibilidade</span>
+                            </button>
+                            ${isAdmin ? `
+                            <button class="tab-btn px-2 sm:px-3 py-2 text-sm rounded-lg transition-colors ${state.currentView === 'admin' ? 'tab-active bg-indigo-50' : 'text-gray-600 hover:bg-gray-100'}" data-view="admin">
+                                <i class="fas fa-cog"></i> <span class="hidden sm:inline">Admin</span>
+                            </button>
+                            ` : ""}
+                            <div class="relative group">
+                                <button class="flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-gray-100 transition-colors">
+                                    <div class="w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center text-white text-sm font-bold">
+                                        ${state.currentUser.name.charAt(0).toUpperCase()}
+                                    </div>
+                                    <span class="text-sm font-medium hidden sm:block">${state.currentUser.name}</span>
+                                    <i class="fas fa-chevron-down text-xs text-gray-400"></i>
+                                </button>
+                                <div class="absolute right-0 mt-2 w-48 bg-white rounded-xl shadow-lg border border-gray-200 opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50">
+                                    <div class="p-3 border-b border-gray-100">
+                                        <p class="text-sm font-medium">${state.currentUser.name}</p>
+                                        <p class="text-xs text-gray-500">${state.currentUser.email}</p>
+                                        <span class="badge ${isAdmin ? 'bg-indigo-100 text-indigo-700' : 'bg-gray-100 text-gray-600'} mt-1">${isAdmin ? 'Admin' : 'Membro'}</span>
+                                    </div>
+                                    <button class="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50 transition-colors" id="btn-logout">
+                                        <i class="fas fa-sign-out-alt mr-2"></i>Sair
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </header>`;
+        }
+
+        function renderLogin() {
+            return `
+            <div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-50 via-white to-purple-50 p-4">
+                <div class="w-full max-w-md fade-in">
+                    <div class="bg-white rounded-2xl shadow-xl border border-gray-100 p-8">
+                        <div class="text-center mb-8">
+                            <div class="w-16 h-16 bg-indigo-600 rounded-2xl flex items-center justify-center mx-auto mb-4">
+                                <i class="fas fa-calendar-alt text-white text-2xl"></i>
+                            </div>
+                            <h1 class="text-2xl font-bold text-gray-900">Controle de Horários</h1>
+                            <p class="text-gray-500 mt-1">Gerencie sua disponibilidade</p>
+                        </div>
+                        <div id="login-form">
+                            <div class="space-y-4">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-1">Email</label>
+                                    <input type="email" id="login-email" class="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all" placeholder="seu@email.com">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-1">Senha</label>
+                                    <input type="password" id="login-password" class="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all" placeholder="••••••••">
+                                </div>
+                                <button id="btn-login" class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-xl transition-colors shadow-lg shadow-indigo-200">
+                                    Entrar
+                                </button>
+                                <p class="text-center text-sm text-gray-500">
+                                    Não tem conta?
+                                    <button id="btn-show-register" class="text-indigo-600 font-medium hover:underline">Cadastre-se</button>
+                                </p>
+                            </div>
+                        </div>
+                        <div id="register-form" class="hidden">
+                            <div class="space-y-3">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-1">Nome completo</label>
+                                    <input type="text" id="reg-name" class="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all" placeholder="Seu nome">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-1">Email</label>
+                                    <input type="email" id="reg-email" class="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all" placeholder="seu@email.com">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-1">Senha</label>
+                                    <input type="password" id="reg-password" class="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all" placeholder="Mínimo 6 caracteres">
+                                </div>
+                                <button id="btn-register" class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-xl transition-colors shadow-lg shadow-indigo-200">
+                                    Criar conta
+                                </button>
+                                <p class="text-center text-sm text-gray-500">
+                                    Já tem conta?
+                                    <button id="btn-show-login" class="text-indigo-600 font-medium hover:underline">Fazer login</button>
+                                </p>
+                            </div>
+                        </div>
+                        <div id="login-error" class="mt-4 text-center text-sm text-red-500 hidden"></div>
+                    </div>
+                    <p class="text-center text-xs text-gray-400 mt-4">Sistema de Controle de Horários v2.0</p>
+                </div>
+            </div>`;
+        }
+
+        function renderDashboard() {
+            const users = state.users.filter(u => u.id !== state.currentUser?.id);
+            const allUsers = state.users;
+            const selected = state.selectedMembers || [];
+
+            let commonSlots = null;
+            if (selected.length > 0) {
+                const selectedUsers = allUsers.filter(u => selected.includes(u.id));
+                if (selectedUsers.length > 0) {
+                    commonSlots = {};
+                    DIAS.forEach(dia => {
+                        const slots = selectedUsers.map(u => {
+                            const av = (u.availability || {})[dia] || [];
+                            return av;
+                        });
+                        if (slots.every(s => s.length > 0)) {
+                            const common = slots.reduce((acc, curr) =>
+                                acc.filter(s => curr.includes(s))
+                            );
+                            if (common.length > 0) commonSlots[dia] = common;
+                        }
+                    });
+                }
+            }
+
+            const sede = state.headquarterSchedule.dias || {};
+
+            const memberCards = allUsers.map(u => {
+                const isSelected = selected.includes(u.id);
+                const totalSlots = Object.values(u.availability || {}).reduce((acc, arr) => acc + (arr.length || 0), 0);
+                return `
+                <div class="member-tag px-4 py-3 rounded-xl border-2 transition-all cursor-pointer ${isSelected ? 'selected border-indigo-500 bg-indigo-50 shadow-md' : 'border-gray-200 bg-white hover:border-indigo-300 hover:shadow-sm'}"
+                     data-member-id="${u.id}">
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center gap-3">
+                            <div class="w-10 h-10 rounded-full bg-indigo-600 flex items-center justify-center text-white font-bold text-sm">
+                                ${u.name.charAt(0).toUpperCase()}
+                            </div>
+                            <div>
+                                <p class="font-medium text-sm">${u.name}</p>
+                                <p class="text-xs text-gray-500">${totalSlots} horários</p>
+                            </div>
+                        </div>
+                        ${isSelected ? '<i class="fas fa-check-circle text-indigo-600 text-lg"></i>' : '<i class="far fa-circle text-gray-300 text-lg"></i>'}
+                    </div>
+                </div>`;
+            }).join("");
+
+            const commonHTML = commonSlots && Object.keys(commonSlots).length > 0
+                ? Object.entries(commonSlots).map(([dia, slots]) => `
+                    <div class="bg-white rounded-xl border border-gray-200 p-4">
+                        <h4 class="font-semibold text-sm text-gray-700 mb-2">${dia}</h4>
+                        <div class="flex flex-wrap gap-1.5">
+                            ${slots.map(s => `<span class="px-3 py-1 bg-green-100 text-green-800 rounded-full text-xs font-medium">${s}</span>`).join("")}
+                        </div>
+                    </div>
+                `).join("")
+                : selected.length > 0
+                    ? `<div class="text-center py-8 text-gray-400"><i class="fas fa-clock text-4xl mb-3"></i><p class="text-sm">Nenhum horário em comum encontrado</p></div>`
+                    : `<div class="text-center py-8 text-gray-400"><i class="fas fa-hand-pointer text-4xl mb-3"></i><p class="text-sm">Selecione membros para ver horários em comum</p></div>`;
+
+            const sedeHTML = Object.keys(sede).length > 0
+                ? Object.entries(sede).map(([dia, h]) => {
+                    if (!h) return "";
+                    return `
+                    <div class="flex items-center justify-between py-2 border-b border-gray-100 last:border-0">
+                        <span class="text-sm font-medium">${dia}</span>
+                        <span class="text-sm text-indigo-600 font-medium">${h.inicio} - ${h.fim}</span>
+                    </div>`;
+                }).join("")
+                : `<p class="text-sm text-gray-400 text-center py-4">Nenhum horário de sede cadastrado</p>`;
+
+            return `
+            <div class="max-w-6xl mx-auto px-4 sm:px-6 py-6 fade-in">
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    <!-- Coluna 1: Membros -->
+                    <div class="lg:col-span-1">
+                        <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5">
+                            <div class="flex items-center justify-between mb-4">
+                                <h3 class="font-semibold text-gray-800"><i class="fas fa-users text-indigo-600 mr-2"></i>Membros</h3>
+                                <span class="badge bg-indigo-100 text-indigo-700">${allUsers.length}</span>
+                            </div>
+                            <div class="space-y-2 max-h-96 overflow-y-auto scrollbar-hide pr-1">
+                                ${memberCards}
+                            </div>
+                            <button id="btn-clear-selection" class="w-full mt-4 py-2 text-sm text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors ${selected.length === 0 ? 'hidden' : ''}">
+                                <i class="fas fa-times mr-1"></i> Limpar seleção
+                            </button>
+                        </div>
+                    </div>
+                    <!-- Coluna 2: Horários em Comum -->
+                    <div class="lg:col-span-1">
+                        <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5">
+                            <div class="flex items-center justify-between mb-4">
+                                <h3 class="font-semibold text-gray-800"><i class="fas fa-handshake text-green-600 mr-2"></i>Horários em Comum</h3>
+                                ${selected.length > 0 ? `<span class="badge bg-green-100 text-green-700">${selected.length} membros</span>` : ""}
+                            </div>
+                            <div class="space-y-3">
+                                ${commonHTML}
+                            </div>
+                        </div>
+                        <!-- Justificativa -->
+                        <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5 mt-4">
+                            <div class="flex items-center justify-between mb-3">
+                                <h3 class="font-semibold text-gray-800"><i class="fas fa-pen text-amber-500 mr-2"></i>Justificativa</h3>
+                            </div>
+                            <p class="text-sm text-gray-500 mb-3">Precisa faltar? Preencha o formulário de justificativa.</p>
+                            <button id="btn-justify" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-medium rounded-xl transition-colors shadow-sm">
+                                <i class="fas fa-external-link-alt mr-2"></i>Abrir Formulário
+                            </button>
+                            <div class="mt-3">
+                                <label class="text-xs text-gray-500 mb-1 block">Minhas justificativas:</label>
+                                <div id="my-justifications" class="text-xs text-gray-400 max-h-24 overflow-y-auto">
+                                    ${renderMyJustifications()}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Coluna 3: Sede e Lembretes -->
+                    <div class="lg:col-span-1">
+                        <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5">
+                            <div class="flex items-center justify-between mb-4">
+                                <h3 class="font-semibold text-gray-800"><i class="fas fa-building text-indigo-600 mr-2"></i>Horário da Sede</h3>
+                                ${state.currentUser?.isAdmin ? `<button id="btn-edit-sede" class="text-xs text-indigo-600 hover:underline"><i class="fas fa-edit"></i></button>` : ""}
+                            </div>
+                            <div class="divide-y divide-gray-100">
+                                ${sedeHTML}
+                            </div>
+                        </div>
+                        <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5 mt-4">
+                            <div class="flex items-center justify-between mb-3">
+                                <h3 class="font-semibold text-gray-800"><i class="fas fa-bell text-indigo-600 mr-2"></i>Lembretes</h3>
+                            </div>
+                            <div class="space-y-2">
+                                <input type="text" id="reminder-text" class="w-full px-3 py-2 border border-gray-300 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="Digite o lembrete...">
+                                <div class="flex gap-2">
+                                    <input type="date" id="reminder-date" class="flex-1 px-3 py-2 border border-gray-300 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none">
+                                    <button id="btn-send-reminder" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-xl transition-colors">
+                                        <i class="fas fa-paper-plane"></i>
+                                    </button>
+                                </div>
+                                <p class="text-xs text-gray-400 mt-1"><i class="fas fa-info-circle"></i> Lembretes são enviados para todos os emails cadastrados.</p>
+                            </div>
+                            <div id="reminder-list" class="mt-3 space-y-1 max-h-32 overflow-y-auto">
+                                ${renderReminders()}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        }
+
+        function renderMyJustifications() {
+            const mine = state.justifications.filter(j => j.userId === state.currentUser?.id);
+            if (mine.length === 0) return `<p class="text-gray-400">Nenhuma justificativa registrada.</p>`;
+            return mine.slice(-3).reverse().map(j => `
+                <div class="py-1 border-b border-gray-100 last:border-0">
+                    <span class="text-gray-600">${formatDate(j.date)}</span>
+                    <span class="text-gray-400 ml-1">- ${j.reason.substring(0, 40)}${j.reason.length > 40 ? "..." : ""}</span>
+                </div>
+            `).join("");
+        }
+
+        function renderReminders() {
+            if (state.reminders.length === 0) return `<p class="text-xs text-gray-400">Nenhum lembrete enviado.</p>`;
+            return state.reminders.slice().reverse().slice(0, 5).map(r => `
+                <div class="text-xs text-gray-600 py-1 border-b border-gray-100 last:border-0">
+                    <span class="font-medium">${formatDate(r.date)}</span> - ${r.text.substring(0, 50)}
+                </div>
+            `).join("");
+        }
+
+        function renderAvailability() {
+            const user = state.currentUser;
+            if (!user) return "";
+            const availability = user.availability || {};
+
+            DIAS.forEach(d => { if (!availability[d]) availability[d] = []; });
+
+            return `
+            <div class="max-w-4xl mx-auto px-4 sm:px-6 py-6 fade-in">
+                <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5 sm:p-6">
+                    <div class="flex items-center justify-between mb-6">
+                        <div>
+                            <h2 class="text-xl font-bold text-gray-800"><i class="fas fa-clock text-indigo-600 mr-2"></i>Minha Disponibilidade</h2>
+                            <p class="text-sm text-gray-500 mt-1">Selecione os horários em que você está disponível (07:00 às 22:00)</p>
+                        </div>
+                        <button id="btn-save-availability" class="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-xl transition-colors shadow-md shadow-indigo-200">
+                            <i class="fas fa-save mr-2"></i>Salvar
+                        </button>
+                    </div>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                        ${DIAS.map(dia => {
+                            const slots = availability[dia] || [];
+                            return `
+                            <div class="bg-gray-50 rounded-xl p-3 border border-gray-200">
+                                <h4 class="font-semibold text-sm text-gray-700 mb-2 text-center">${dia}</h4>
+                                <div class="flex flex-wrap gap-1.5 justify-center">
+                                    ${HORARIOS.map(h => {
+                                        const isSelected = slots.includes(h);
+                                        return `<div class="time-slot ${isSelected ? 'selected bg-indigo-600 text-white' : 'bg-white text-gray-600 border border-gray-300 hover:border-indigo-400'}"
+                                                      data-day="${dia}" data-hour="${h}">${h}</div>`;
+                                    }).join("")}
+                                </div>
+                            </div>`;
+                        }).join("")}
+                    </div>
+                </div>
+            </div>`;
+        }
+
+        function renderAdmin() {
+            if (!state.currentUser?.isAdmin) return "";
+            const users = state.users;
+
+            return `
+            <div class="max-w-5xl mx-auto px-4 sm:px-6 py-6 fade-in">
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    <!-- Gerenciar Usuários -->
+                    <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5 sm:p-6">
+                        <div class="flex items-center justify-between mb-4">
+                            <h3 class="font-semibold text-gray-800"><i class="fas fa-user-cog text-indigo-600 mr-2"></i>Gerenciar Usuários</h3>
+                            <button id="btn-add-user" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium rounded-lg transition-colors">
+                                <i class="fas fa-plus mr-1"></i>Adicionar
+                            </button>
+                        </div>
+                        <div class="space-y-2 max-h-96 overflow-y-auto scrollbar-hide">
+                            ${users.map(u => {
+                                const isCurrent = u.id === state.currentUser.id;
+                                return `
+                                <div class="flex items-center justify-between p-3 rounded-xl border border-gray-200 ${isCurrent ? 'bg-indigo-50 border-indigo-300' : 'bg-white'}" data-user-id="${u.id}">
+                                    <div class="flex items-center gap-3">
+                                        <div class="w-10 h-10 rounded-full bg-indigo-600 flex items-center justify-center text-white font-bold text-sm">
+                                            ${u.name.charAt(0).toUpperCase()}
+                                        </div>
+                                        <div>
+                                            <p class="text-sm font-medium">${u.name} ${isCurrent ? '<span class="text-xs text-indigo-600">(você)</span>' : ''}</p>
+                                            <p class="text-xs text-gray-500">${u.email}</p>
+                                            <span class="badge ${u.isAdmin ? 'bg-indigo-100 text-indigo-700' : 'bg-gray-100 text-gray-600'} text-xs">${u.isAdmin ? 'Admin' : 'Membro'}</span>
+                                        </div>
+                                    </div>
+                                    ${!isCurrent ? `
+                                    <div class="flex gap-1">
+                                        <button class="btn-transfer-admin p-1.5 text-indigo-600 hover:bg-indigo-100 rounded-lg transition-colors" title="Transferir admin">
+                                            <i class="fas fa-crown"></i>
+                                        </button>
+                                        <button class="btn-remove-user p-1.5 text-red-500 hover:bg-red-100 rounded-lg transition-colors" title="Remover">
+                                            <i class="fas fa-trash"></i>
+                                        </button>
+                                    </div>
+                                    ` : ""}
+                                </div>`;
+                            }).join("")}
+                        </div>
+                    </div>
+                    <!-- Horário da Sede + Config -->
+                    <div class="space-y-6">
+                        <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5 sm:p-6">
+                            <h3 class="font-semibold text-gray-800 mb-4"><i class="fas fa-building text-indigo-600 mr-2"></i>Horário da Sede</h3>
+                            <div class="space-y-3">
+                                ${DIAS.map(dia => {
+                                    const h = state.headquarterSchedule.dias[dia] || { inicio: "08:00", fim: "18:00" };
+                                    return `
+                                    <div class="flex items-center gap-3">
+                                        <span class="w-20 text-sm font-medium text-gray-700">${dia}</span>
+                                        <input type="time" class="sede-inicio w-28 px-2 py-1.5 border border-gray-300 rounded-lg text-sm" data-day="${dia}" value="${h.inicio}">
+                                        <span class="text-gray-400">até</span>
+                                        <input type="time" class="sede-fim w-28 px-2 py-1.5 border border-gray-300 rounded-lg text-sm" data-day="${dia}" value="${h.fim}">
+                                        <label class="flex items-center gap-1.5 text-sm text-gray-500">
+                                            <input type="checkbox" class="sede-active" data-day="${dia}" ${h.inicio ? "checked" : ""}>
+                                            Ativo
+                                        </label>
+                                    </div>`;
+                                }).join("")}
+                                <button id="btn-save-sede" class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-xl transition-colors mt-2">
+                                    <i class="fas fa-save mr-2"></i>Salvar Horário da Sede
+                                </button>
+                            </div>
+                        </div>
+                        <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5 sm:p-6">
+                            <h3 class="font-semibold text-gray-800 mb-3"><i class="fas fa-envelope text-indigo-600 mr-2"></i>Configuração de Email</h3>
+                            <div class="space-y-3">
+                                <div class="flex items-center gap-3">
+                                    <label class="relative inline-flex items-center cursor-pointer">
+                                        <input type="checkbox" id="email-enabled" class="sr-only peer" ${state.emailConfig.enabled ? "checked" : ""}>
+                                        <div class="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-indigo-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600"></div>
+                                    </label>
+                                    <span class="text-sm text-gray-600">Ativar notificações por email</span>
+                                </div>
+                                <input type="text" id="smtp-config" class="w-full px-3 py-2 border border-gray-300 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="Servidor SMTP (opcional)" value="${state.emailConfig.smtp || ""}">
+                                <button id="btn-save-email" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-xl transition-colors">
+                                    Salvar Configuração
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        }
+
+        function renderJustificationModal() {
+            return `
+            <div class="modal-overlay fade-in" id="justify-modal">
+                <div class="bg-white rounded-2xl p-6 w-full max-w-md mx-4 shadow-2xl">
+                    <div class="flex items-center justify-between mb-4">
+                        <h3 class="text-lg font-bold text-gray-800">Formulário de Justificativa</h3>
+                        <button class="close-modal text-gray-400 hover:text-gray-600 text-xl"><i class="fas fa-times"></i></button>
+                    </div>
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Data da ausência</label>
+                            <input type="date" id="justify-date" class="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Motivo</label>
+                            <textarea id="justify-reason" rows="3" class="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none resize-none" placeholder="Descreva o motivo da ausência..."></textarea>
+                        </div>
+                        <button id="btn-submit-justify" class="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-medium rounded-xl transition-colors">
+                            <i class="fas fa-paper-plane mr-2"></i>Enviar Justificativa
+                        </button>
+                    </div>
+                </div>
+            </div>`;
+        }
+
+        function renderAddUserModal() {
+            return `
+            <div class="modal-overlay fade-in" id="add-user-modal">
+                <div class="bg-white rounded-2xl p-6 w-full max-w-md mx-4 shadow-2xl">
+                    <div class="flex items-center justify-between mb-4">
+                        <h3 class="text-lg font-bold text-gray-800">Adicionar Novo Usuário</h3>
+                        <button class="close-modal text-gray-400 hover:text-gray-600 text-xl"><i class="fas fa-times"></i></button>
+                    </div>
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Nome</label>
+                            <input type="text" id="add-name" class="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="Nome completo">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Email</label>
+                            <input type="email" id="add-email" class="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="email@exemplo.com">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Senha</label>
+                            <input type="password" id="add-password" class="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="Senha temporária">
+                        </div>
+                        <label class="flex items-center gap-2 text-sm text-gray-600">
+                            <input type="checkbox" id="add-is-admin" class="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500">
+                            Tornar administrador
+                        </label>
+                        <button id="btn-confirm-add" class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-xl transition-colors">
+                            Adicionar Usuário
+                        </button>
+                    </div>
+                </div>
+            </div>`;
+        }
+
+        // ============================================================
+        // MOUNT
+        // ============================================================
+
+        function renderApp() {
+            const app = document.getElementById("app");
+            if (!state.currentUser) {
+                app.innerHTML = renderLogin();
+                attachLoginEvents();
+                return;
+            }
+
+            const view = state.currentView || "dashboard";
+            let content = "";
+            switch (view) {
+                case "dashboard": content = renderDashboard(); break;
+                case "availability": content = renderAvailability(); break;
+                case "admin": content = renderAdmin(); break;
+                default: content = renderDashboard();
+            }
+
+            app.innerHTML = renderHeader() + content;
+
+            if (state.statusMessage) {
+                const toast = document.createElement("div");
+                toast.className = `toast fade-in px-4 py-3 rounded-xl shadow-lg text-white text-sm font-medium ${state.statusMessage.type === 'success' ? 'bg-green-500' : 'bg-red-500'}`;
+                toast.innerHTML = `<i class="fas ${state.statusMessage.type === 'success' ? 'fa-check-circle' : 'fa-exclamation-circle'} mr-2"></i>${state.statusMessage.message}`;
+                app.appendChild(toast);
+                setTimeout(() => toast.remove(), 3000);
+            }
+
+            attachEvents();
+        }
+
+        // ============================================================
+        // EVENT DELEGATION
+        // ============================================================
+
+        function attachEvents() {
+            document.querySelectorAll(".tab-btn").forEach(btn => {
+                btn.addEventListener("click", (e) => {
+                    state.currentView = btn.dataset.view;
+                    renderApp();
+                });
+            });
+
+            const logoutBtn = document.getElementById("btn-logout");
+            if (logoutBtn) {
+                logoutBtn.addEventListener("click", () => {
+                    state.currentUser = null;
+                    state.selectedMembers = [];
+                    state.currentView = "dashboard";
+                    saveState();
+                    renderApp();
+                    showToast("Você saiu do sistema.", "success");
+                });
+            }
+
+            document.querySelectorAll(".member-tag").forEach(el => {
+                el.addEventListener("click", () => {
+                    const id = el.dataset.memberId;
+                    const idx = state.selectedMembers.indexOf(id);
+                    if (idx > -1) state.selectedMembers.splice(idx, 1);
+                    else state.selectedMembers.push(id);
+                    renderApp();
+                });
+            });
+
+            const clearBtn = document.getElementById("btn-clear-selection");
+            if (clearBtn) {
+                clearBtn.addEventListener("click", () => {
+                    state.selectedMembers = [];
+                    renderApp();
+                });
+            }
+
+            document.querySelectorAll(".time-slot").forEach(el => {
+                el.addEventListener("click", () => {
+                    const day = el.dataset.day;
+                    const hour = el.dataset.hour;
+                    const user = state.currentUser;
+                    if (!user) return;
+                    if (!user.availability) user.availability = {};
+                    if (!user.availability[day]) user.availability[day] = [];
+                    const idx = user.availability[day].indexOf(hour);
+                    if (idx > -1) user.availability[day].splice(idx, 1);
+                    else user.availability[day].push(hour);
+                    renderApp();
+                });
+            });
+
+            const saveAvBtn = document.getElementById("btn-save-availability");
+            if (saveAvBtn) {
+                saveAvBtn.addEventListener("click", () => {
+                    const user = state.currentUser;
+                    const idx = state.users.findIndex(u => u.id === user.id);
+                    if (idx > -1) state.users[idx] = user;
+                    saveState();
+                    showToast("Disponibilidade salva com sucesso!", "success");
+                });
+            }
+
+            const justifyBtn = document.getElementById("btn-justify");
+            if (justifyBtn) {
+                justifyBtn.addEventListener("click", () => {
+                    const modal = document.createElement("div");
+                    modal.innerHTML = renderJustificationModal();
+                    document.body.appendChild(modal.firstElementChild);
+                    attachModalEvents();
+                });
+            }
+
+            const sendRemBtn = document.getElementById("btn-send-reminder");
+            if (sendRemBtn) {
+                sendRemBtn.addEventListener("click", () => {
+                    const text = document.getElementById("reminder-text")?.value.trim();
+                    const date = document.getElementById("reminder-date")?.value;
+                    if (!text || !date) {
+                        showToast("Preencha o texto e a data do lembrete.", "error");
+                        return;
+                    }
+                    state.reminders.push({ id: generateId(), text, date, sentBy: state.currentUser.name, sentAt: new Date().toISOString() });
+                    saveState();
+                    const emails = state.users.map(u => u.email).join(", ");
+                    showToast(`Lembrete registrado! Seria enviado para: ${emails}`, "success");
+                    document.getElementById("reminder-text").value = "";
+                    document.getElementById("reminder-date").value = "";
+                    renderApp();
+                });
+            }
+
+            document.querySelectorAll(".btn-transfer-admin").forEach(btn => {
+                btn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    const card = btn.closest("[data-user-id]");
+                    const userId = card.dataset.userId;
+                    const target = state.users.find(u => u.id === userId);
+                    if (!target) return;
+                    if (confirm(`Transferir cargo de administrador para ${target.name}? Você perderá o acesso admin.`)) {
+                        state.currentUser.isAdmin = false;
+                        target.isAdmin = true;
+                        const idx = state.users.findIndex(u => u.id === userId);
+                        if (idx > -1) state.users[idx] = target;
+                        const selfIdx = state.users.findIndex(u => u.id === state.currentUser.id);
+                        if (selfIdx > -1) state.users[selfIdx] = state.currentUser;
+                        saveState();
+                        showToast(`Administrador transferido para ${target.name}!`, "success");
+                        renderApp();
+                    }
+                });
+            });
+
+            document.querySelectorAll(".btn-remove-user").forEach(btn => {
+                btn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    const card = btn.closest("[data-user-id]");
+                    const userId = card.dataset.userId;
+                    const target = state.users.find(u => u.id === userId);
+                    if (!target) return;
+                    if (confirm(`Tem certeza que deseja remover ${target.name}? Esta ação não pode ser desfeita.`)) {
+                        state.users = state.users.filter(u => u.id !== userId);
+                        state.selectedMembers = state.selectedMembers.filter(id => id !== userId);
+                        saveState();
+                        showToast(`${target.name} removido do sistema.`, "success");
+                        renderApp();
+                    }
+                });
+            });
+
+            const addUserBtn = document.getElementById("btn-add-user");
+            if (addUserBtn) {
+                addUserBtn.addEventListener("click", () => {
+                    const modal = document.createElement("div");
+                    modal.innerHTML = renderAddUserModal();
+                    document.body.appendChild(modal.firstElementChild);
+                    attachAddUserEvents();
+                });
+            }
+
+            const saveSedeBtn = document.getElementById("btn-save-sede");
+            if (saveSedeBtn) {
+                saveSedeBtn.addEventListener("click", () => {
+                    const dias = {};
+                    document.querySelectorAll(".sede-inicio").forEach(inp => {
+                        const day = inp.dataset.day;
+                        const fim = document.querySelector(`.sede-fim[data-day="${day}"]`);
+                        const active = document.querySelector(`.sede-active[data-day="${day}"]`);
+                        if (active.checked) {
+                            dias[day] = { inicio: inp.value, fim: fim.value };
+                        } else {
+                            dias[day] = null;
+                        }
+                    });
+                    state.headquarterSchedule.dias = dias;
+                    saveState();
+                    showToast("Horário da sede atualizado!", "success");
+                });
+            }
+
+            const editSedeBtn = document.getElementById("btn-edit-sede");
+            if (editSedeBtn) {
+                editSedeBtn.addEventListener("click", () => {
+                    state.currentView = "admin";
+                    renderApp();
+                });
+            }
+
+            const saveEmailBtn = document.getElementById("btn-save-email");
+            if (saveEmailBtn) {
+                saveEmailBtn.addEventListener("click", () => {
+                    const enabled = document.getElementById("email-enabled")?.checked || false;
+                    const smtp = document.getElementById("smtp-config")?.value || "";
+                    state.emailConfig = { enabled, smtp };
+                    saveState();
+                    showToast("Configuração de email salva!", "success");
+                });
+            }
+        }
+
+        // ============================================================
+        // MODAL EVENTS
+        // ============================================================
+
+        function attachModalEvents() {
+            document.querySelectorAll(".close-modal, .modal-overlay").forEach(el => {
+                el.addEventListener("click", (e) => {
+                    if (e.target === el || e.target.closest(".close-modal")) {
+                        el.remove();
+                    }
+                });
+            });
+
+            const submitBtn = document.getElementById("btn-submit-justify");
+            if (submitBtn) {
+                submitBtn.addEventListener("click", () => {
+                    const date = document.getElementById("justify-date")?.value;
+                    const reason = document.getElementById("justify-reason")?.value.trim();
+                    if (!date || !reason) {
+                        showToast("Preencha a data e o motivo.", "error");
+                        return;
+                    }
+                    state.justifications.push({
+                        id: generateId(),
+                        userId: state.currentUser.id,
+                        userName: state.currentUser.name,
+                        date,
+                        reason,
+                        createdAt: new Date().toISOString()
+                    });
+                    saveState();
+                    document.querySelector(".modal-overlay")?.remove();
+                    showToast("Justificativa enviada com sucesso!", "success");
+                    renderApp();
+                });
+            }
+        }
+
+        function attachAddUserEvents() {
+            document.querySelectorAll(".close-modal, .modal-overlay").forEach(el => {
+                el.addEventListener("click", (e) => {
+                    if (e.target === el || e.target.closest(".close-modal")) {
+                        el.remove();
+                    }
+                });
+            });
+
+            const confirmBtn = document.getElementById("btn-confirm-add");
+            if (confirmBtn) {
+                confirmBtn.addEventListener("click", () => {
+                    const name = document.getElementById("add-name")?.value.trim();
+                    const email = document.getElementById("add-email")?.value.trim();
+                    const password = document.getElementById("add-password")?.value.trim();
+                    const isAdmin = document.getElementById("add-is-admin")?.checked || false;
+                    if (!name || !email || !password) {
+                        showToast("Preencha todos os campos.", "error");
+                        return;
+                    }
+                    if (state.users.find(u => u.email === email)) {
+                        showToast("Email já cadastrado.", "error");
+                        return;
+                    }
+                    state.users.push({
+                        id: generateId(),
+                        name,
+                        email,
+                        password,
+                        isAdmin,
+                        availability: {},
+                        createdAt: new Date().toISOString()
+                    });
+                    saveState();
+                    document.querySelector(".modal-overlay")?.remove();
+                    showToast(`Usuário ${name} adicionado com sucesso!`, "success");
+                    renderApp();
+                });
+            }
+        }
+
+        // ============================================================
+        // LOGIN EVENTS
+        // ============================================================
+
+        function attachLoginEvents() {
+            const loginBtn = document.getElementById("btn-login");
+            const registerBtn = document.getElementById("btn-register");
+            const showRegBtn = document.getElementById("btn-show-register");
+            const showLoginBtn = document.getElementById("btn-show-login");
+            const errorDiv = document.getElementById("login-error");
+
+            if (loginBtn) {
+                loginBtn.addEventListener("click", () => {
+                    const email = document.getElementById("login-email")?.value.trim();
+                    const password = document.getElementById("login-password")?.value.trim();
+                    if (!email || !password) {
+                        errorDiv.textContent = "Preencha email e senha.";
+                        errorDiv.classList.remove("hidden");
+                        return;
+                    }
+                    const user = state.users.find(u => u.email === email && u.password === password);
+                    if (!user) {
+                        errorDiv.textContent = "Email ou senha incorretos.";
+                        errorDiv.classList.remove("hidden");
+                        return;
+                    }
+                    state.currentUser = user;
+                    state.currentView = "dashboard";
+                    state.selectedMembers = [];
+                    saveState();
+                    renderApp();
+                    showToast(`Bem-vindo(a), ${user.name}!`, "success");
+                });
+            }
+
+            if (registerBtn) {
+                registerBtn.addEventListener("click", () => {
+                    const name = document.getElementById("reg-name")?.value.trim();
+                    const email = document.getElementById("reg-email")?.value.trim();
+                    const password = document.getElementById("reg-password")?.value.trim();
+                    if (!name || !email || !password) {
+                        showToast("Preencha todos os campos.", "error");
+                        return;
+                    }
+                    if (password.length < 6) {
+                        showToast("Senha deve ter no mínimo 6 caracteres.", "error");
+                        return;
+                    }
+                    if (state.users.find(u => u.email === email)) {
+                        showToast("Email já cadastrado.", "error");
+                        return;
+                    }
+                    const isAdmin = state.users.length === 0;
+                    const newUser = {
+                        id: generateId(),
+                        name,
+                        email,
+                        password,
+                        isAdmin,
+                        availability: {},
+                        createdAt: new Date().toISOString()
+                    };
+                    state.users.push(newUser);
+                    state.currentUser = newUser;
+                    state.currentView = "dashboard";
+                    saveState();
+                    renderApp();
+                    showToast(`Conta criada com sucesso! ${isAdmin ? "Você é o administrador principal." : ""}`, "success");
+                });
+            }
+
+            if (showRegBtn) {
+                showRegBtn.addEventListener("click", () => {
+                    document.getElementById("login-form").classList.add("hidden");
+                    document.getElementById("register-form").classList.remove("hidden");
+                    if (errorDiv) errorDiv.classList.add("hidden");
+                });
+            }
+
+            if (showLoginBtn) {
+                showLoginBtn.addEventListener("click", () => {
+                    document.getElementById("login-form").classList.remove("hidden");
+                    document.getElementById("register-form").classList.add("hidden");
+                    if (errorDiv) errorDiv.classList.add("hidden");
+                });
+            }
+
+            document.getElementById("login-password")?.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") loginBtn?.click();
+            });
+            document.getElementById("reg-password")?.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") registerBtn?.click();
+            });
+        }
+
+        // ============================================================
+        // INIT
+        // ============================================================
+
+        loadState();
+        state.currentView = "dashboard";
+        state.selectedMembers = state.selectedMembers || [];
+
+        if (state.users.length === 0) {
+            state.currentUser = null;
+        }
+
+        renderApp();
+    </script>
+</body>
+</html>
+```
